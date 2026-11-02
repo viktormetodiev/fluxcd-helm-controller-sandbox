@@ -1,21 +1,30 @@
 name: sync-upstream
 
-# Opens a pull request that merges the latest upstream release of
-# fluxcd/helm-controller into this fork. The pull request always gets opened:
-# if the merge has conflicts or the result does not build, CI on the pull
-# request fails and someone has to take care of it. See "Maintaining the fork
-# up to date" in the README.
+# Opens a pull request that merges the latest release of this fork's upstream into
+# it, with tools/fork-sync and the settings in .github/fork-sync.yaml. The pull
+# request is always opened: if the merge has conflicts or the result does not
+# build, CI on it fails and someone has to take care of it. See "Maintaining the
+# fork up to date" in the README. This file is the same in every Qdrant fork that
+# uses it.
+#
+# With dry_run, everything happens except pushing the branch and opening the pull
+# request. Every run shows the result in the job summary.
 
 on:
   schedule:
-    # Weekdays, early morning UTC.
-    - cron: '0 6 * * 1-5'
+    # Once a week, on Monday morning (UTC).
+    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Upstream release tag to sync, e.g. v1.9.6 (default: the latest stable release)'
+        description: 'Upstream release tag to sync, vX.Y.Z (default: the latest stable release)'
         required: false
         type: string
+      dry_run:
+        description: 'Do not push the branch or open the pull request'
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -23,108 +32,104 @@ concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
-env:
-  UPSTREAM_URL: https://github.com/fluxcd/helm-controller.git
-
 jobs:
-  sync:
+  # Decides whether to run. Without the fork-sync GitHub App's credentials,
+  # scheduled runs skip quietly instead of failing every week,
+  # manual runs fail with a clear error, and dry runs go ahead (they do not need
+  # them).
+  gate:
     if: github.repository_owner == 'qdrant'
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - id: gate
+        env:
+          APP_CLIENT_ID: ${{ vars.FORK_SYNC_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.FORK_SYNC_APP_PRIVATE_KEY }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if { [ -n "$APP_CLIENT_ID" ] && [ -n "$APP_PRIVATE_KEY" ]; } || [ "$DRY_RUN" = true ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = schedule ]; then
+            echo "::notice title=Sync skipped::The fork-sync GitHub App's credentials are not available, see the README."
+          else
+            echo "::error title=The app's credentials are not available::This run cannot read the FORK_SYNC_APP_CLIENT_ID variable and the FORK_SYNC_APP_PRIVATE_KEY secret of the fork-sync GitHub App. See the README."
+            exit 1
+          fi
+
+  sync:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read # for target --check-existing, which only reads public data
+    env:
+      GIT_AUTHOR_NAME: github-actions[bot]
+      GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+      GIT_COMMITTER_NAME: github-actions[bot]
+      GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
     steps:
-      - name: Checkout main
+      # The credentials are not persisted: the adaptations run upstream's code
+      # (make tidy runs its Makefile), and nothing before the publish step can
+      # read the token.
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
           fetch-depth: 0
-          # BOT_GITHUB_TOKEN instead of GITHUB_TOKEN: pushes and pull requests
-          # made with GITHUB_TOKEN do not trigger the CI workflows, and the
-          # whole point is for CI to judge the result.
-          token: ${{ secrets.BOT_GITHUB_TOKEN }}
-          persist-credentials: true # zizmor: ignore[artipacked] needed to push the sync branch
+          persist-credentials: false
 
+      # No Go cache: this job runs upstream's unreviewed code on the default
+      # branch, and a cache it saves would be restored by other workflows.
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: tools/fork-sync/go.mod
+          cache: false
 
-      - name: Configure git identity
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      # Built before the merge, from the fork's own code.
+      - name: Build fork-sync
+        run: go -C tools/fork-sync build -o "$RUNNER_TEMP/fork-sync" .
 
       - name: Find the upstream release to sync
         id: target
         env:
-          INPUT_TAG: ${{ inputs.tag }}
-        run: scripts/sync-upstream.sh target "$INPUT_TAG"
-
-      - name: Skip if the sync branch or a pull request already exists
-        id: existing
-        if: steps.target.outputs.status == 'needs-sync'
-        env:
-          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
-          BRANCH: ${{ steps.target.outputs.branch }}
-        run: |
-          # --state all: a pull request that was closed without merging is a
-          # decision not to take this release. Do not reopen it every morning.
-          prs=$(gh pr list --state all --head "$BRANCH" --json number --jq 'length')
-          if [ "$prs" != "0" ] || git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
-            echo "Branch or pull request for $BRANCH already exists, nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          # Dry runs always go ahead: they exist to exercise the merge.
+          CHECK_EXISTING: ${{ inputs.dry_run != true }}
+        run: '"$RUNNER_TEMP/fork-sync" target --tag "$TAG" --check-existing="$CHECK_EXISTING" >> "$GITHUB_OUTPUT"'
 
       - name: Merge the upstream release
         id: merge
-        if: steps.target.outputs.status == 'needs-sync' && steps.existing.outputs.skip == 'false'
+        if: steps.target.outputs.status == 'needs-sync'
         env:
           TAG: ${{ steps.target.outputs.tag }}
-        run: scripts/sync-upstream.sh merge "$TAG"
+          # setup-go pins the Go of tools/fork-sync; a release can need a newer one.
+          GOTOOLCHAIN: auto
+        run: '"$RUNNER_TEMP/fork-sync" merge "$TAG" --body-file "$RUNNER_TEMP/pr-body.md" --summary-file "$GITHUB_STEP_SUMMARY" >> "$GITHUB_OUTPUT"'
 
-      - name: Push branch and open pull request
-        if: steps.merge.outputs.status == 'merged' || steps.merge.outputs.status == 'conflict'
+      # A short-lived token of the fork-sync GitHub App, installed only on the
+      # Flux forks, for this repository only. Pull requests it opens trigger CI, unlike GITHUB_TOKEN's.
+      # It is revoked when the job ends.
+      - name: Create a token for publishing
+        id: app-token
+        if: inputs.dry_run != true && steps.merge.outcome == 'success'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.FORK_SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FORK_SYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          # Syncs change the workflows that follow upstream.
+          permission-workflows: write
+
+      - name: Push the branch and open the pull request
+        if: inputs.dry_run != true && steps.merge.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
-          TAG: ${{ steps.merge.outputs.tag }}
+          # The only step that gets the token.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BRANCH: ${{ steps.merge.outputs.branch }}
-          MERGE_STATUS: ${{ steps.merge.outputs.status }}
-          CONFLICTS_FILE: ${{ steps.merge.outputs.conflicts_file }}
-        run: |
-          upstream_repo=${UPSTREAM_URL%.git}
-          {
-            echo "Merges upstream [\`${TAG}\`](${upstream_repo}/releases/tag/${TAG}) and re-applies the Qdrant adaptations (\`scripts/rename-api-groups.sh\`, \`make tidy\`)."
-            echo
-            echo "Opened automatically by the \`sync-upstream\` workflow. **CI is the verdict**: if it is red, this release needs work before it can be taken."
-            echo
-            if [ "$MERGE_STATUS" = "conflict" ]; then
-              echo "### Merge conflicts"
-              echo
-              echo "The merge had conflicts. The conflict markers are committed as-is, so CI fails until they are resolved. Conflicting files:"
-              echo
-              sed 's/^/- `/; s/$/`/' "$CONFLICTS_FILE"
-              echo
-            fi
-            echo "### Reviewing"
-            echo
-            echo "The merge commit from upstream is not worth reviewing. Look at the commits that follow it (rename script, \`make tidy\`) and at CI."
-            echo
-            echo "### After merging"
-            echo
-            echo "- [ ] Tag the fork release: \`${TAG}-qdrant.1\` and \`api/${TAG}-qdrant.1\` (bump the number for a re-release of the same upstream version)."
-            echo "- [ ] If fluxcd-source-controller has a newer fork release, point the \`source-controller/api\` replace in \`go.mod\` and \`SOURCE_BRANCH\` in the Makefile at it, then run \`make tidy\`."
-            echo "- [ ] qdrant-cloud-agent: bump the \`replace\` lines in \`go.mod\`, \`make download-crd-deps\` and review the CRD diff (see docs/upgrading-flux-controller-crds.md)."
-          } > pr-body.md
-          git push origin "$BRANCH"
-          draft=()
-          if [ "$MERGE_STATUS" = "conflict" ]; then
-            draft=(--draft)
-          fi
-          gh pr create \
-            --base main \
-            --head "$BRANCH" \
-            --title "Sync upstream ${TAG}" \
-            --body-file pr-body.md \
-            "${draft[@]}"
+        run: '"$RUNNER_TEMP/fork-sync" publish --branch "$BRANCH" --body-file "$RUNNER_TEMP/pr-body.md"'

@@ -18,58 +18,87 @@ by our custom ones.
 
 ### Maintaining the fork up to date
 
-#### Automated: the `sync-upstream` workflow
+The [`sync-upstream`](.github/workflows/sync-upstream.yaml) workflow opens a PR
+when upstream publishes a new stable release (`vX.Y.Z`). It runs on Mondays, or
+on demand from the Actions tab (for a given tag, or with `dry_run` to stop before
+pushing). The PR, `Sync upstream vX.Y.Z`, has up to two commits:
 
-The [`sync-upstream`](.github/workflows/sync-upstream.yaml) workflow runs on
-weekdays (and on demand from the Actions tab, optionally for a specific
-tag). When upstream publishes a new stable release (`vX.Y.Z`), it opens a PR
-named `Sync upstream vX.Y.Z` that merges the tag, runs
-`./scripts/rename-api-groups.sh` and `make tidy`. It uses
-[`scripts/sync-upstream.sh`](scripts/sync-upstream.sh), which you can also run
-locally to reproduce what the workflow did.
+1. `Merge upstream tag vX.Y.Z`: upstream's changes, merged automatically.
+2. `chore: apply Qdrant adaptations ...`, only when needed: what the fork owns,
+   put back or regenerated. Its message lists the files.
 
-The PR is always opened and **CI is the verdict**. If the merge had conflicts,
-the PR is a draft with the conflict markers committed, and the
-[`conflict-markers`](.github/workflows/conflict-markers.yaml) check fails until
-they are resolved. If it merged cleanly but does not build or pass the tests,
-CI is red and someone needs to fix it on the PR branch. The workflow never
-merges or tags anything. Closing a PR without merging tells it to leave that
-release alone.
+The workflow runs [`tools/fork-sync`](tools/fork-sync), a small Go tool. What the
+fork owns, the API group rename and the commands that adapt upstream's code
+(`make tidy`, and `make manifests`, which regenerates the renamed CRD from the
+API types) are set in [`.github/fork-sync.yaml`](.github/fork-sync.yaml).
 
-This fork depends on the source-controller fork's API (see the `replace` in
-`go.mod` and `SOURCE_BRANCH` in the Makefile). The workflow does not touch
-either: when a new source-controller fork release exists, update them as
-described in the manual steps below.
+**Reviewing a sync PR**
 
-Compatibility with the cloud-agent is not checked here: the agent's own CI is
-the gate once its `replace` lines are bumped to the new fork release.
+- CI is the verdict. Failing builds or tests are fixed on the PR branch.
+- With merge conflicts the PR is a draft, with the markers and a list of the
+  conflicting files (`.sync-upstream-conflicts`) committed. The
+  [`conflict-markers`](.github/workflows/conflict-markers.yaml) check fails until
+  the conflicts are resolved and that list is deleted.
+- If `make tidy` or `make manifests` fails (say, the release needs a newer Go)
+  the PR still opens, with a note.
+- Merge with a merge commit, never squash or rebase: the upstream tag has to stay
+  an ancestor of `main`.
+- The workflow never merges or tags. Closing a PR without merging tells it to
+  skip that release. The agent's own CI is what checks compatibility with it.
 
-#### Manual
+**The source-controller fork.** This fork uses the source-controller fork's API
+(the `source-controller/api` replace in `go.mod`) and CRDs (`SOURCE_BRANCH` in
+the Makefile). The sync does not change either. When a release needs a newer
+source-controller API, the build only passes once the source-controller fork
+has a matching `-qdrant` tag: update both on the sync branch.
 
-Use this when the workflow cannot help, e.g. to sync something that is not a
-release tag.
+**Porting the adapter.** [`adapter/adapter.go`](adapter/adapter.go) is the fork's
+own code: it adds the HelmRelease reconciler to `qdrant-cloud-agent`'s controller
+manager, which upstream's `main.go` cannot do (`package main` cannot be
+imported). It sets it up the way `main.go` does, so when a release changes that
+setup, the `adapter` check fails on the sync PR. Make the same change upstream
+made in `main.go`, on the sync branch:
 
-- Configure and fetch upstream/main.
-- Create your development branch from origin/main and merge upstream/main into
-  it. You can run the merge with `-X theirs` option.
-- Solve the git conflicts if any.
-- As there might be new files or content added in upstream, we might need to
-  rename groups again. You can do that executing
-  `./scripts/rename-api-groups.sh`.
-- You are probably updating [source-controller](https://github.com/fluxcd/source-controller) as well. If that's the case, you
-  need to update the dependency in this project. 
-  - Update the `SOURCE_BRANCH` var in the Makefile with the new commit
-  - Update go.mod: `go mod edit -replace github.com/fluxcd/source-controller/api=github.com/qdrant/fluxcd-source-controller/api@PLACE_HERE_THE_NEW_COMMIT_SHA`
-- Run `go mod tidy` to clean up the dependencies and execute the tests of the project with `make test`.
-- Ideally, they are passing. Otherwise, you need to work on fixing any possible
-  issue.
-- Push your development branch. After that, you would need to test it using it
-  in the cloud-agent to confirm everything works as expected.
-- Once you confirm it works fine, create a PR for review.
-- **Note for the reviewer:** The merge commit from upstream/main doesn't make
-  sense to review it. Focus on the commits with the changes relevant for the
-  project.
+```sh
+git fetch --no-tags https://github.com/fluxcd/helm-controller.git "+refs/tags/*:refs/upstream-tags/*"
+git diff refs/upstream-tags/v1.6.2 refs/upstream-tags/v1.7.1 -- main.go   # the last synced and the new release
+```
 
+**The fork owns `.github/`,** because workflows run with this repository's
+credentials. Upstream's changes there are put back to the fork's version in the
+adaptations commit (on conflicted syncs too), except for the files listed in
+`followUpstream` in [`.github/fork-sync.yaml`](.github/fork-sync.yaml): the e2e
+and fuzz workflows and the Dependabot config, which need no secrets and nothing
+specific to Flux. A new upstream workflow shows up as removed in the adaptations
+commit; to take it, add it to `followUpstream`.
+
+**Credentials.** The workflow pushes and opens PRs as a GitHub App installed
+only on the Flux forks (not `GITHUB_TOKEN`, whose PRs do not trigger CI and which
+cannot push the workflow changes that come with upstream's commits). It needs
+the app's client ID in the `FORK_SYNC_APP_CLIENT_ID` variable and its private
+key in the `FORK_SYNC_APP_PRIVATE_KEY` secret, and the app needs write access to
+contents, pull requests and workflows. Each run creates a short-lived token for
+this repository, and only the publish step receives it. Without the
+credentials, scheduled runs skip with a notice and manual runs fail with a clear
+error.
+
+**Tests.** `go -C tools/fork-sync test ./...`, run in CI as `fork-tools-test`.
+The tool is a copy of the one in
+[fluxcd-source-controller](https://github.com/qdrant/fluxcd-source-controller/tree/main/tools/fork-sync):
+fixes go to both.
+
+#### Manual sync
+
+From an up-to-date `main` (needs `go` and `make`):
+
+```sh
+go -C tools/fork-sync run . --repo ../.. merge vX.Y.Z
+git push origin sync/upstream-vX.Y.Z
+```
+
+Open a PR against `main` and merge it with a merge commit. Resolve conflicts on
+that branch and delete `.sync-upstream-conflicts`. Do not use `-X theirs`, it
+silently prefers upstream's side of every conflict.
 
 ---
 
