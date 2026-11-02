@@ -1,0 +1,3 @@
+.github/workflows/e2e.yaml
+go.sum
+internal/controller/helmrelease_controller.go
