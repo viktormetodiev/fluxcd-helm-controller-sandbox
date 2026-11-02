@@ -43,7 +43,7 @@ jobs:
         run: kind load docker-image test/helm-controller:latest
       - name: Build source-controller image
         run: |
-          git clone --branch chore/estebany/rebase-onto-v1.7.4 --depth 1 https://github.com/qdrant/fluxcd-source-controller.git /tmp/source-controller
+          git clone --branch sync/upstream-v1.10.1 --depth 1 https://github.com/viktormetodiev/fluxcd-source-controller-sandbox.git /tmp/source-controller
           cd /tmp/source-controller
           docker buildx build -t test/source-controller:latest --platform linux/amd64 --load .
       - name: Load source-controller image
