@@ -117,6 +117,18 @@ jobs:
           make docker-build IMG=test/helm-controller:latest \
             BUILD_PLATFORMS=linux/amd64 \
             BUILD_ARGS="--load"
+      # Fork: run the source-controller fork, which serves the cd.qdrant.io
+      # sources, instead of upstream's, as in the kind job.
+      - name: Build source-controller image
+        run: |
+          git clone --branch sync/upstream-v1.10.1 --depth 1 https://github.com/viktormetodiev/fluxcd-source-controller-sandbox.git /tmp/source-controller
+          docker buildx build -t test/source-controller:latest --platform linux/amd64 --load /tmp/source-controller
+          kind load docker-image test/source-controller:latest
+      - name: Use the source-controller fork
+        run: |
+          make download-crd-deps
+          kubectl apply -f build/config/crd/bases/
+          cd config/default && kustomize edit set image fluxcd/source-controller=test/source-controller:latest
       - name: Run remote kubeconfig e2e
         # Reuses the "kind" cluster the setup action created and adds a second one.
         run: hack/ci/kubeconfig-e2e.sh
