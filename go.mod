@@ -8,7 +8,7 @@ replace (
 )
 
 // Replace source-controller API with qdrant fork
-replace github.com/fluxcd/source-controller/api => github.com/qdrant/fluxcd-source-controller/api v1.9.3-qdrant.1
+replace github.com/fluxcd/source-controller/api => github.com/viktormetodiev/fluxcd-source-controller-sandbox/api v1.9.3-qdrant.1.0.20261102152710-59f78aedc40f
 
 // Replace digest lib to master to gather access to BLAKE3.
 // xref: https://github.com/opencontainers/go-digest/pull/66
