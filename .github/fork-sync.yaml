@@ -21,9 +21,11 @@ ownedPaths:
   - .github/
   # The fork's own tooling, which names upstream's API groups on purpose.
   - tools/
-  # Deleted in the fork: the API types carry the renamed group, so make
-  # manifests generates cd.qdrant.io_helmreleases.yaml instead.
+  # The CRD comes from the renamed API types: make manifests generates
+  # cd.qdrant.io_helmreleases.yaml, and upstream's is deleted. The merge keeps
+  # the fork's version of both, and the adaptation regenerates the renamed one.
   - config/crd/bases/helm.toolkit.fluxcd.io_helmreleases.yaml
+  - config/crd/bases/cd.qdrant.io_helmreleases.yaml
 
 # Files under the owned paths that still take upstream's changes. They run with
 # this repository's credentials too, so they must use none of the fork's
@@ -53,6 +55,8 @@ rename:
     - {from: "group: helm\n", to: "group: cd\n"}
     - {from: helm.toolkit.fluxcd.io, to: cd.qdrant.io}
     - {from: shortName=hr, to: shortName=qdranthr}
+    # kubectl's short name, in the e2e scripts.
+    - {from: " hr/", to: " qdranthr/"}
   # Entries of the shortNames lists in the CRDs.
   shortNames:
     - {from: hr, to: qdranthr}
